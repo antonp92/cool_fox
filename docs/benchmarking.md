@@ -109,6 +109,16 @@ delay these logs; `process.csv` continues to sample independently. Pool pieces
 rest before reuse, and a pressure limit on spare blocks now stays in force
 through subsequent allocations until the next budget update.
 
+Upload slices now return to the pool when their last owner releases them,
+without the extra 2.5-second texture-allocation quarantine. Recorded lists
+retain staging through reset after their final GPU submission; uploads on the
+copy queue retain it through their fence wait. No completion wait is removed.
+This follows Direct3D 12's [fence-based upload reuse](https://learn.microsoft.com/en-us/windows/win32/direct3d12/fence-based-resource-management).
+`VICTORY_STAGING_REUSE=0` restores the previous upload quarantine for comparison.
+Device-texture heap pieces keep their existing delay. A failed asynchronous
+copy or fence wait now ends the runtime through its GPU-failure path, rather
+than marking an incomplete upload ready and releasing its source for reuse.
+
 These counters overlap. Staging payload lies inside upload-pool allocations;
 cached staging is part of live staging; scratch spares are part of live scratch.
 Device allocation sizes and DXGI usage are not resident system RAM. Correlate
@@ -143,3 +153,7 @@ and environment isolation, normal/nonzero exits, log draining and duration
 termination without reading or executing a real game. Memory-guard checks use
 an impossible minimum headroom to stop a small sleeping fixture without
 allocating large buffers, and verify that zero floors disable the guard.
+The upload-pool GPU test checks 64 patterns copied back after fence completion,
+then reuses the same slices without advancing a wall-clock timer; another live
+slice must remain separate. Like the existing GPU tests, it returns early when
+no D3D12 host can be created, so confirm its validation message for a hardware run.
