@@ -29,6 +29,10 @@ public class Fixture {
         if (Environment.GetEnvironmentVariable("VICTORY_BVH_BUILDER") != null) return 24;
         Console.WriteLine("fixture stdout");
         Console.Error.WriteLine("fixture stderr");
+        Thread.Sleep(100);
+        using (var readable = new FileStream("stdout.log", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+            Console.WriteLine("live log readable");
+        }
         if (Path.GetFileName(args[1]).Contains("timeout")) Thread.Sleep(10000);
         return Path.GetFileName(args[1]).Contains("failure") ? 7 : 0;
     }
@@ -64,7 +68,8 @@ try {
         $output = Join-Path $WorkRoot $case
         $caught = $false
         try {
-            & $benchmark -VictoryExe $fixture -GameExe $game -DataDir $saveCopy -CacheDir (Join-Path $WorkRoot 'cache') -OutputRoot $output -DurationSeconds 1 -SampleMilliseconds 100 -Settings @{VICTORY_PIPELINE_WORKERS='3'} | Out-Null
+            $result = @(& $benchmark -VictoryExe $fixture -GameExe $game -DataDir $saveCopy -CacheDir (Join-Path $WorkRoot 'cache') -OutputRoot $output -DurationSeconds 1 -SampleMilliseconds 100 -Settings @{VICTORY_PIPELINE_WORKERS='3'})
+            Assert ($result.Count -eq 1 -and $result[0] -is [string]) 'Runner emitted values other than its result directory'
         } catch { $caught = $true }
         $run = Get-ChildItem -LiteralPath $output -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $receipt = Get-Content -LiteralPath (Join-Path $run.FullName 'run.json') -Raw | ConvertFrom-Json

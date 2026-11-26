@@ -126,11 +126,13 @@ try {
     if (-not $process.Start()) { throw 'Could not start the runtime.' }
     $receipt.PID = $process.Id
     $receipt.Status = 'running'
-    $stdout = [IO.File]::Create((Join-Path $runDir 'stdout.log'))
-    $stderr = [IO.File]::Create((Join-Path $runDir 'stderr.log'))
+    $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $receiptFile -Encoding utf8
+    $stdout = [IO.FileStream]::new((Join-Path $runDir 'stdout.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, $true)
+    $stderr = [IO.FileStream]::new((Join-Path $runDir 'stderr.log'), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, $true)
     $outTask = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
     $errTask = $process.StandardError.BaseStream.CopyToAsync($stderr)
     $samples = [IO.StreamWriter]::new((Join-Path $runDir 'process.csv'))
+    $samples.AutoFlush = $true
     $samples.WriteLine('elapsed_ms,private_bytes,working_set_bytes,cpu_seconds,system_commit_bytes,system_commit_limit_bytes,available_physical_bytes')
     $clock = [Diagnostics.Stopwatch]::StartNew()
     while (-not $process.HasExited) {
@@ -155,8 +157,8 @@ try {
         [void]$process.WaitForExit($SampleMilliseconds)
     }
     $process.WaitForExit()
-    $outTask.GetAwaiter().GetResult()
-    $errTask.GetAwaiter().GetResult()
+    [void]$outTask.GetAwaiter().GetResult()
+    [void]$errTask.GetAwaiter().GetResult()
     $receipt.ExitCode = $process.ExitCode
     if (-not $receipt.EndReason) { $receipt.EndReason = 'process exited' }
     $receipt.Status = if ($receipt.EndReason -eq 'duration limit') { 'timed run completed' } elseif ($process.ExitCode -eq 0) { 'completed' } else { 'failed' }
@@ -167,7 +169,7 @@ try {
 } finally {
     if ($receipt.PID -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
     # Join stream pumps before closing their files, including on a sampling error.
-    foreach ($task in @($outTask, $errTask)) { if ($null -ne $task) { try { $task.GetAwaiter().GetResult() } catch {} } }
+    foreach ($task in @($outTask, $errTask)) { if ($null -ne $task) { try { [void]$task.GetAwaiter().GetResult() } catch {} } }
     foreach ($stream in @($samples, $stdout, $stderr)) { if ($null -ne $stream) { $stream.Dispose() } }
     $receipt['FinishedUtc'] = [DateTime]::UtcNow.ToString('o')
     $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $receiptFile -Encoding utf8
