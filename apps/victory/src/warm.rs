@@ -59,8 +59,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
     all.truncate(limit.unwrap_or(usize::MAX));
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let plan = crate::workers::plan(victory_core::resources::Compilation::Pipeline, jobs)?;
+    let jobs = plan.jobs;
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
         keys.len(),
@@ -75,12 +75,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
-    std::thread::scope(|s| {
+    std::thread::scope(|s| -> Result<()> {
+        let mut workers = Vec::new();
         for _ in 0..jobs.min(chunks.len()) {
-            s.spawn(|| {
+            workers.push(s.spawn(|| -> Result<()> {
                 while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let mut rest = chunk;
                     while !rest.is_empty() {
+                        crate::workers::wait_for_pipeline_memory(plan.automatic)?;
                         let (made, ended) = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
@@ -89,7 +91,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            if count.is_multiple_of(1000) {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
@@ -108,9 +110,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                         }
                     }
                 }
-            });
+                Ok(())
+            }));
         }
-    });
+        for worker in workers {
+            worker.join().map_err(|_| anyhow::anyhow!("pipeline warm-up worker panicked"))??;
+        }
+        Ok(())
+    })?;
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
