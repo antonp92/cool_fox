@@ -486,7 +486,6 @@ impl Drop for Staging {
 
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
@@ -495,6 +494,13 @@ pub(crate) fn memory() -> [u64; 3] {
         .as_ref()
         .map_or(0, |map| map.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+}
+
+/// Payload still owned by the texture cache, also included in `memory`'s
+/// total. Other live staging can be held by recorded or running lists.
+pub(crate) fn cached_staging_bytes() -> u64 {
+    STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        .map_or(0, |map| map.values().map(|s| s.bytes).sum())
 }
 
 /// Staging buffers let go as idle since the start, and their bytes.

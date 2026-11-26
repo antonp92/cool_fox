@@ -12,6 +12,7 @@ mod shader;
 mod translate;
 #[cfg(windows)]
 mod warm;
+mod workers;
 
 use std::path::PathBuf;
 
@@ -85,9 +86,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
-        #[arg(long)]
-        jobs: Option<usize>,
+        /// Worker threads (default: CPU and available-memory aware).
+        #[arg(long, value_parser = clap::value_parser!(std::num::NonZeroUsize))]
+        jobs: Option<std::num::NonZeroUsize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
@@ -101,9 +102,9 @@ enum Command {
     /// of the translator.
     Shaders {
         paths: Vec<PathBuf>,
-        /// Worker threads (default: every logical core).
-        #[arg(long)]
-        jobs: Option<usize>,
+        /// Worker threads (default: CPU and available-memory aware).
+        #[arg(long, value_parser = clap::value_parser!(std::num::NonZeroUsize))]
+        jobs: Option<std::num::NonZeroUsize>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -111,9 +112,9 @@ enum Command {
     /// of the translator or the driver. Goes on where it was stopped.
     #[cfg(windows)]
     Warm {
-        /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
-        jobs: Option<usize>,
+        /// Processes at once (default: CPU and available-memory aware).
+        #[arg(long, value_parser = clap::value_parser!(std::num::NonZeroUsize))]
+        jobs: Option<std::num::NonZeroUsize>,
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
@@ -150,7 +151,7 @@ enum Command {
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
-    Replay(replay::Replay),
+    Replay(Box<replay::Replay>),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -201,21 +202,33 @@ fn main() -> Result<()> {
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs.map(|n| n.get()));
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs.map(|n| n.get()))
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs.map(|n| n.get())),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            these,
+        } => warm::run(jobs.map(|n| n.get()), limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
@@ -228,7 +241,7 @@ fn main() -> Result<()> {
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => replay::run(*options),
         Command::Config => show_config(),
     }
 }
@@ -277,4 +290,28 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn diagnostic_replay_options_still_parse() {
+        assert!(Cli::try_parse_from(["victory", "replay", "capture-folder"]).is_ok());
+    }
+
+    #[test]
+    fn offline_job_counts_reject_zero_and_accept_overrides() {
+        for command in ["translate", "shaders"] {
+            assert!(Cli::try_parse_from(["victory", command, "--jobs", "0"]).is_err());
+            assert!(Cli::try_parse_from(["victory", command, "--jobs", "12"]).is_ok());
+        }
+        #[cfg(windows)]
+        {
+            assert!(Cli::try_parse_from(["victory", "warm", "--jobs", "0"]).is_err());
+            assert!(Cli::try_parse_from(["victory", "warm", "--jobs", "12"]).is_ok());
+        }
+    }
 }

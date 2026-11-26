@@ -10,12 +10,15 @@
 //! forty seconds of a world without its textures.
 //! `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.
 //!
-//! A piece given back is used again only two seconds later (nothing the card
+//! A device-texture piece given back is used again only two seconds later (nothing the card
 //! was told before that is still running: Windows resets a card that takes
 //! that long over one submission), and by then no list names it (the owners' rule, as for allocations of their own): a
 //! texture's piece comes back when the last reference to the host texture
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
+//! Upload pieces can be reused then without an additional wall-clock delay:
+//! recorded lists keep their staging until reset after GPU completion, and
+//! uploads ahead keep it through their copy-fence wait.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -203,7 +206,13 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: if most < SPARE { most } else { SPARE },
+            most,
+            retry_growth_at: 0,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -302,10 +311,20 @@ impl<B: Clone> Pool<B> {
         self.resting.push_back((now + REST, piece));
     }
 
+    /// The last GPU reader has finished and no recorded list can read this
+    /// slice again. Unlike a device texture, an upload slice needs no placed
+    /// resource aliasing quarantine; its owning buffer stays an upload buffer.
+    fn give_completed(&mut self, piece: Piece) {
+        let block = self.blocks[piece.block].as_mut().expect("a live upload piece");
+        block.free.give(piece.start, piece.len);
+    }
+
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        // `room` gives upload storage its own pressure limit. Do not restore
+        // the texture heap's allowance on the next allocation.
+        self.reclaim(now, self.spare, false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -338,6 +357,23 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    fn snapshot(&self) -> PoolMemory {
+        PoolMemory {
+            allocated: self.blocks() as u64 * BLOCK,
+            free: self.blocks.iter().flatten()
+                .map(|b| b.free.0.values().sum::<u64>()).sum(),
+            resting: self.resting.iter().map(|(_, p)| p.len).sum(),
+        }
+    }
+}
+
+/// Pool allocation sizes, not resident system RAM. Free and resting bytes are
+/// disjoint parts of `allocated`; resting pieces are not reusable yet.
+pub(crate) struct PoolMemory {
+    pub allocated: u64,
+    pub free: u64,
+    pub resting: u64,
 }
 
 /// A mapped upload buffer's memory.
@@ -348,6 +384,13 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+
+/// Sequential snapshots of the device texture and CPU upload pools.
+pub(crate) fn snapshots() -> [PoolMemory; 2] {
+    let textures = lock(&TEXTURES).snapshot();
+    let staging = lock(&STAGING).snapshot();
+    [textures, staging]
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -368,12 +411,19 @@ pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
-/// Part of a block of mapped upload memory, back in the pool when dropped.
+/// Part of mapped upload memory. Its owner must retain it until every GPU
+/// reader finishes: `Step::Texture` until list reset, or `ahead::Job` until
+/// its copy fence completes. It can then return to the pool on drop.
 pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *REUSE.get_or_init(|| std::env::var_os("VICTORY_STAGING_REUSE").is_none_or(|v| v != "0")) {
+            lock(&STAGING).give_completed(self.0);
+        } else {
+            lock(&STAGING).give(self.0, now());
+        }
     }
 }
 
@@ -637,6 +687,76 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn upload_pressure_limit_survives_allocations_and_recovers_only_on_a_budget_tick() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        pool.reclaim(0, 0, true);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        pool.give(piece, 0);
+        pool.rested(REST - 1);
+        assert_eq!(pool.blocks(), 1, "a resting piece stays allocated");
+        pool.rested(REST);
+        assert_eq!(pool.blocks(), 0, "allocations must preserve the zero-spare policy");
+
+        pool.reclaim(REST, SPARE, true);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, REST, || Some(2)).unwrap();
+        pool.give(piece, REST);
+        pool.rested(2 * REST);
+        assert_eq!(pool.blocks(), 1, "a recovered pool can retain its spare again");
+    }
+
+    #[test]
+    fn pool_snapshot_separates_live_free_and_resting_bytes() {
+        let mut pool = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let before = pool.snapshot();
+        assert_eq!((before.allocated, before.free, before.resting), (BLOCK, BLOCK / 2, 0));
+        pool.give(piece, 0);
+        let resting = pool.snapshot();
+        assert_eq!((resting.allocated, resting.free, resting.resting), (BLOCK, BLOCK / 2, BLOCK / 2));
+        pool.rested(REST);
+        let ready = pool.snapshot();
+        assert_eq!((ready.allocated, ready.free, ready.resting), (BLOCK, BLOCK, 0));
+    }
+
+    #[test]
+    fn completed_upload_slices_reuse_space_without_touching_a_live_neighbour() {
+        let mut pool = Pool::new(SPARE);
+        let (first, _, _) = pool.take(4096, 512, 0, || Some(1)).unwrap();
+        let (live, _, _) = pool.take(4096, 512, 0, || Some(2)).unwrap();
+        pool.give_completed(first);
+        let (again, _, reused) = pool.take(4096, 512, 0, || Some(3)).unwrap();
+        assert_eq!((again, reused), (first, true));
+        assert_ne!(again.start, live.start);
+        assert_eq!(pool.snapshot().resting, 0);
+        assert_eq!(pool.blocks(), 1);
+    }
+
+    #[test]
+    fn gpu_reads_match_across_completed_upload_slice_reuse() {
+        let Some(host) = crate::host::host() else { return };
+        let mut rig = crate::inplace::Rig::new(&host.device).unwrap();
+        let mut pool = Pool::new(SPARE);
+        for pattern in 1..=64u8 {
+            let make = || host.upload_buffer(BLOCK).map(|(buffer, data)| Upload(buffer, data));
+            let (piece, upload, _) = pool.take(4096, 512, 0, make).unwrap();
+            // SAFETY: this piece is ours, still held throughout `fetch`'s
+            // copy submission and fence wait. Only then is it returned.
+            unsafe { upload.1.add(piece.start as usize).write_bytes(pattern, 4096) };
+            let (neighbour, _, _) = pool.take(4096, 512, 0, make).unwrap();
+            assert_ne!(piece.start, neighbour.start, "a live GPU source stays owned");
+            let read = rig.fetch(&upload.0, piece.start, 4096).unwrap();
+            assert!(read.iter().all(|&byte| byte == pattern), "copy {pattern}");
+            pool.give_completed(piece);
+            pool.give_completed(neighbour);
+            assert_eq!(pool.snapshot().resting, 0);
+            assert_eq!(pool.blocks(), 1, "64 copies share one upload block");
+        }
+        // SAFETY: a plain device-status query after every copy completed.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        eprintln!("validated 64 fenced GPU copies with upload slice reuse");
     }
 
     #[test]

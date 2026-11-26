@@ -254,7 +254,9 @@ impl Worker {
             }
             value += 1;
             if let Err(e) = self.copy(&jobs, value) {
-                tracing::warn!(error = %e, "uploads ahead did not run");
+                // Never publish an incomplete upload or release its slice
+                // for reuse after a failed execute/signal/fence wait.
+                crate::host::fail(format_args!("uploads ahead did not complete ({e})"));
             }
             finish(jobs);
         }

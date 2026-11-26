@@ -177,7 +177,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads = jobs.unwrap_or(4).max(1);
+    let threads = crate::workers::plan(victory_core::resources::Compilation::Shader, jobs)?.jobs;
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
@@ -271,8 +271,12 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let compilation = if pipelines {
+        victory_core::resources::Compilation::Pipeline
+    } else {
+        victory_core::resources::Compilation::Shader
+    };
+    let threads = crate::workers::plan(compilation, jobs)?.jobs;
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
@@ -398,8 +402,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = crate::workers::plan(victory_core::resources::Compilation::Shader, jobs)?.jobs;
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);

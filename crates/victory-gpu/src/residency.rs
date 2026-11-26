@@ -139,6 +139,55 @@ pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
 
+/// Opt-in attribution after the once-per-second sweep, also in release builds.
+/// These counters overlap and include device allocation sizes; they must not
+/// be summed or subtracted from process private bytes as a RAM accounting total.
+pub(crate) fn log_memory() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_LOG").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let Some(status) = memory_status() else { return };
+    let staging = crate::texture::memory();
+    let [textures, uploads] = crate::pool::snapshots();
+    tracing::info!(
+        pid = std::process::id(),
+        frame = crate::frame::current(),
+        pressure = pressured(),
+        physical_free_mib = status.ullAvailPhys >> 20,
+        available_commit_mib = status.ullAvailPageFile >> 20,
+        staging_buffers = staging[0],
+        staging_cached_buffers = staging[2],
+        staging_payload_mib = staging[1] >> 20,
+        staging_cached_mib = crate::texture::cached_staging_bytes() >> 20,
+        staging_pool_allocated_mib = uploads.allocated >> 20,
+        staging_pool_free_mib = uploads.free >> 20,
+        staging_pool_resting_mib = uploads.resting >> 20,
+        texture_pool_allocated_mib = textures.allocated >> 20,
+        texture_pool_free_mib = textures.free >> 20,
+        texture_pool_resting_mib = textures.resting >> 20,
+        scratch_live_mib = crate::host::ALIVE[2].load(Ordering::Relaxed) >> 20,
+        scratch_spare_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
+        other_list_upload_mib = crate::host::ALIVE[7].load(Ordering::Relaxed) >> 20,
+        shadow_snapshot_spare_mib = crate::shadow::snapshot_pool_bytes() >> 20,
+        buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+        host_texture_allocated_mib = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed) >> 20,
+        tiled_texture_allocated_mib = crate::tiles::given_total() >> 20,
+        pipelines_waiting = crate::pipeline::making(),
+        "runtime memory snapshot"
+    );
+    if let Some([local, shared]) = crate::host::host().and_then(|h| h.video_memory_groups()) {
+        tracing::info!(
+            frame = crate::frame::current(),
+            local_budget_mib = local[0] >> 20,
+            local_usage_mib = local[1] >> 20,
+            nonlocal_budget_mib = shared[0] >> 20,
+            nonlocal_usage_mib = shared[1] >> 20,
+            "runtime GPU memory snapshot"
+        );
+    }
+}
+
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
