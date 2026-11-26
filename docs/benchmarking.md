@@ -88,6 +88,34 @@ arbitrary executable is not asserted to match the current checkout. Nonzero
 runtime exits produce a failed receipt and a script error. Time-limited runs
 are labeled explicitly rather than reported as natural successful exits.
 
+The runner also stops its own process tree after sustained low system memory:
+by default, less than 512 MiB available physical RAM or 256 MiB available commit
+for five seconds. A healthy sample resets that interval. `run.json` records
+the limits and the triggering sample, with status `stopped for memory pressure`;
+this is an interrupted run, not a completed benchmark. The check runs outside
+the runtime so a slow submission does not delay it. It samples at
+`SampleMilliseconds`, so pressure between samples can be missed. Set
+`-MinimumPhysicalMiB`, `-MinimumCommitMiB` and `-MemoryPressureSeconds` to change
+the policy; zero disables an individual floor, and both zero disable the guard.
+These floors are initial operating limits, not a guarantee against allocation
+failure. Other user processes are never terminated by the runner.
+
+`VICTORY_MEMORY_LOG=1` enables allocation breakdowns in release builds and is
+enabled by the benchmark runner. After each submission sweep (at most once per
+second), the log reports live and cached texture staging, allocated/free/resting
+upload-pool storage, scratch and snapshot spares, host texture allocations,
+pipeline backlog and DXGI local/nonlocal memory use. A stalled submission can
+delay these logs; `process.csv` continues to sample independently. Pool pieces
+rest before reuse, and a pressure limit on spare blocks now stays in force
+through subsequent allocations until the next budget update.
+
+These counters overlap. Staging payload lies inside upload-pool allocations;
+cached staging is part of live staging; scratch spares are part of live scratch.
+Device allocation sizes and DXGI usage are not resident system RAM. Correlate
+the logs with process private bytes and system commit rather than adding the
+counters into an apparent RAM total. `VICTORY_SWEEP=0` also disables these
+sweep-triggered breakdowns.
+
 `process.csv` samples process private bytes, working set and cumulative CPU time,
 alongside system commit and available physical memory. It samples the initial
 runtime process, not the aggregate of independently relaunched processes. GPU
@@ -112,4 +140,6 @@ pwsh -File scripts\tests\benchmark.tests.ps1 -WorkRoot D:\VIctoryBenchmarkTests
 The PowerShell checks compile a small synthetic .NET Framework process with
 Windows' csc.exe. They test profiling, repository-path rejection, child arguments
 and environment isolation, normal/nonzero exits, log draining and duration
-termination without reading or executing a real game.
+termination without reading or executing a real game. Memory-guard checks use
+an impossible minimum headroom to stop a small sleeping fixture without
+allocating large buffers, and verify that zero floors disable the guard.

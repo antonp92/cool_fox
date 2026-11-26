@@ -33,7 +33,7 @@ public class Fixture {
         using (var readable = new FileStream("stdout.log", FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
             Console.WriteLine("live log readable");
         }
-        if (Path.GetFileName(args[1]).Contains("timeout")) Thread.Sleep(10000);
+        if (Path.GetFileName(args[1]).Contains("timeout") || Path.GetFileName(args[1]).Contains("pressure")) Thread.Sleep(10000);
         return Path.GetFileName(args[1]).Contains("failure") ? 7 : 0;
     }
 }
@@ -62,13 +62,23 @@ try {
     $failedReceipt = Get-Content -LiteralPath (Join-Path $failedRun.FullName 'run.json') -Raw | ConvertFrom-Json
     Assert ($failedReceipt.Status -eq 'failed' -and $failedReceipt.Error) 'Launch failure receipt was lost'
     Write-Output 'start-failure fixture passed'
-    foreach ($case in @('success', 'failure', 'timeout')) {
+    foreach ($case in @('success', 'failure', 'timeout', 'pressure', 'commit-pressure', 'pressure-disabled')) {
         $game = Join-Path $WorkRoot "$case game.exe"
         Set-Content -LiteralPath $game -Value 'Synthetic test input; not an executable.'
         $output = Join-Path $WorkRoot $case
         $caught = $false
+        $guard = @{}
+        if ($case -eq 'pressure') {
+            # An impossible physical floor triggers the real guard without
+            # consuming memory or depending on current host pressure.
+            $guard = @{MinimumPhysicalMiB=1048576; MinimumCommitMiB=0; MemoryPressureSeconds=1; DurationSeconds=5}
+        } elseif ($case -eq 'commit-pressure') {
+            $guard = @{MinimumPhysicalMiB=0; MinimumCommitMiB=1048576; MemoryPressureSeconds=1; DurationSeconds=5}
+        } elseif ($case -eq 'pressure-disabled') {
+            $guard = @{MinimumPhysicalMiB=0; MinimumCommitMiB=0; DurationSeconds=1}
+        } else { $guard = @{DurationSeconds=1} }
         try {
-            $result = @(& $benchmark -VictoryExe $fixture -GameExe $game -DataDir $saveCopy -CacheDir (Join-Path $WorkRoot 'cache') -OutputRoot $output -DurationSeconds 1 -SampleMilliseconds 100 -Settings @{VICTORY_PIPELINE_WORKERS='3'})
+            $result = @(& $benchmark -VictoryExe $fixture -GameExe $game -DataDir $saveCopy -CacheDir (Join-Path $WorkRoot 'cache') -OutputRoot $output -SampleMilliseconds 100 -Settings @{VICTORY_PIPELINE_WORKERS='3'} @guard)
             Assert ($result.Count -eq 1 -and $result[0] -is [string]) 'Runner emitted values other than its result directory'
         } catch { $caught = $true }
         $run = Get-ChildItem -LiteralPath $output -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -77,8 +87,15 @@ try {
             Assert (-not $caught -and $receipt.ExitCode -eq 0 -and $receipt.Status -eq 'completed') 'Successful run failed'
         } elseif ($case -eq 'failure') {
             Assert ($caught -and $receipt.ExitCode -eq 7 -and $receipt.Status -eq 'failed') 'Failed run was not recorded'
+        } elseif ($case -in @('pressure', 'commit-pressure')) {
+            Assert (-not $caught -and $receipt.Status -eq 'stopped for memory pressure' -and $receipt.EndReason -eq 'memory pressure') 'Memory stop was not recorded'
+            Assert ($receipt.MemoryGuard.Enabled) 'Memory guard was disabled'
+            if ($case -eq 'pressure') { Assert ($receipt.MemoryGuard.Trigger.LowPhysical -and -not $receipt.MemoryGuard.Trigger.LowCommit) 'Wrong physical trigger' }
+            else { Assert ($receipt.MemoryGuard.Trigger.LowCommit -and -not $receipt.MemoryGuard.Trigger.LowPhysical) 'Wrong commit trigger' }
+            Assert ($receipt.MemoryGuard.Trigger.ElapsedMilliseconds -ge 1000) 'Guard did not wait for sustained pressure'
         } else {
             Assert (-not $caught -and $receipt.EndReason -eq 'duration limit') 'Bounded run failed'
+            if ($case -eq 'pressure-disabled') { Assert (-not $receipt.MemoryGuard.Enabled) 'Zero floors did not disable the guard' }
         }
         Assert ((Get-Content -LiteralPath (Join-Path $run.FullName 'stdout.log') -Raw) -match 'fixture stdout') 'stdout not drained'
         Assert ((Get-Content -LiteralPath (Join-Path $run.FullName 'stderr.log') -Raw) -match 'fixture stderr') 'stderr not drained'
@@ -86,4 +103,4 @@ try {
         Write-Output "$case fixture passed"
     }
 } finally { $env:VICTORY_BVH_BUILDER = $oldValue }
-Write-Output 'Profile, path guard, environment isolation, exit handling, log draining, and timeout checks passed.'
+Write-Output 'Profile, path guard, environment isolation, exit handling, log draining, timeout, and memory-stop checks passed.'

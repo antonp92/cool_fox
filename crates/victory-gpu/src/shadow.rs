@@ -1259,6 +1259,11 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// CPU snapshot buffers kept for reuse, excluding those still in use.
+pub(crate) fn snapshot_pool_bytes() -> u64 {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|v| v.capacity() as u64).sum()
+}
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were

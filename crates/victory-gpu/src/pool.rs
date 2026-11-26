@@ -203,7 +203,13 @@ struct Pool<B> {
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: if most < SPARE { most } else { SPARE },
+            most,
+            retry_growth_at: 0,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -305,7 +311,9 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        // `room` gives upload storage its own pressure limit. Do not restore
+        // the texture heap's allowance on the next allocation.
+        self.reclaim(now, self.spare, false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -338,6 +346,23 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    fn snapshot(&self) -> PoolMemory {
+        PoolMemory {
+            allocated: self.blocks() as u64 * BLOCK,
+            free: self.blocks.iter().flatten()
+                .map(|b| b.free.0.values().sum::<u64>()).sum(),
+            resting: self.resting.iter().map(|(_, p)| p.len).sum(),
+        }
+    }
+}
+
+/// Pool allocation sizes, not resident system RAM. Free and resting bytes are
+/// disjoint parts of `allocated`; resting pieces are not reusable yet.
+pub(crate) struct PoolMemory {
+    pub allocated: u64,
+    pub free: u64,
+    pub resting: u64,
 }
 
 /// A mapped upload buffer's memory.
@@ -348,6 +373,13 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+
+/// Sequential snapshots of the device texture and CPU upload pools.
+pub(crate) fn snapshots() -> [PoolMemory; 2] {
+    let textures = lock(&TEXTURES).snapshot();
+    let staging = lock(&STAGING).snapshot();
+    [textures, staging]
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -637,6 +669,38 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn upload_pressure_limit_survives_allocations_and_recovers_only_on_a_budget_tick() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        pool.reclaim(0, 0, true);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        pool.give(piece, 0);
+        pool.rested(REST - 1);
+        assert_eq!(pool.blocks(), 1, "a resting piece stays allocated");
+        pool.rested(REST);
+        assert_eq!(pool.blocks(), 0, "allocations must preserve the zero-spare policy");
+
+        pool.reclaim(REST, SPARE, true);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, REST, || Some(2)).unwrap();
+        pool.give(piece, REST);
+        pool.rested(2 * REST);
+        assert_eq!(pool.blocks(), 1, "a recovered pool can retain its spare again");
+    }
+
+    #[test]
+    fn pool_snapshot_separates_live_free_and_resting_bytes() {
+        let mut pool = Pool::new(SPARE);
+        let (piece, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let before = pool.snapshot();
+        assert_eq!((before.allocated, before.free, before.resting), (BLOCK, BLOCK / 2, 0));
+        pool.give(piece, 0);
+        let resting = pool.snapshot();
+        assert_eq!((resting.allocated, resting.free, resting.resting), (BLOCK, BLOCK / 2, BLOCK / 2));
+        pool.rested(REST);
+        let ready = pool.snapshot();
+        assert_eq!((ready.allocated, ready.free, ready.resting), (BLOCK, BLOCK, 0));
     }
 
     #[test]

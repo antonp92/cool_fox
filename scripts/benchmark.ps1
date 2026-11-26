@@ -17,6 +17,9 @@ param(
     [string]$DataDir,
     [ValidateRange(1, 3600)][int]$DurationSeconds = 300,
     [ValidateRange(100, 10000)][int]$SampleMilliseconds = 1000,
+    [ValidateRange(0, 1048576)][int]$MinimumPhysicalMiB = 512,
+    [ValidateRange(0, 1048576)][int]$MinimumCommitMiB = 256,
+    [ValidateRange(1, 60)][int]$MemoryPressureSeconds = 5,
     [ValidateSet('cold', 'warm', 'unspecified')][string]$CacheState = 'unspecified',
     [string]$Scene = 'unspecified',
     [hashtable]$Settings = @{}
@@ -91,7 +94,7 @@ $effective = @{
     VICTORY_AMBIENT_AIR='1.5'; VICTORY_AMBIENT='constant:0.8'; VICTORY_TEXTURE_GUARD='0'
     VICTORY_THIN='0'; VICTORY_JOIN_PARTS='0'; VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_CBV='1'
     VICTORY_UPLOAD_AHEAD='1'; VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_CARD_BUFFERS_MIN_KB='64'
-    VICTORY_LOG='info'; VICTORY_TIMER_LOG='1'
+    VICTORY_LOG='info'; VICTORY_TIMER_LOG='1'; VICTORY_MEMORY_LOG='1'
 }
 foreach ($key in $Settings.Keys) { $effective[$key] = [string]$Settings[$key] }
 $effective.VICTORY_GAME_DIR = Split-Path -Parent $GameExe
@@ -114,6 +117,11 @@ $receipt = [ordered]@{
     BinaryMatchesSource='unverified'; Arguments=@($start.ArgumentList); Settings=$effective
     DurationSeconds=$DurationSeconds; SampleMilliseconds=$SampleMilliseconds
     Status='starting'; PID=$null; ExitCode=$null; EndReason=$null; Error=$null
+    MemoryGuard=@{
+        Enabled=($MinimumPhysicalMiB -gt 0 -or $MinimumCommitMiB -gt 0)
+        MinimumPhysicalMiB=$MinimumPhysicalMiB; MinimumCommitMiB=$MinimumCommitMiB
+        SustainedSeconds=$MemoryPressureSeconds; Trigger=$null
+    }
     FrameTimes='Runtime logs only; process samples are not per-present frame timings.'
 }
 $receiptFile = Join-Path $runDir 'run.json'
@@ -135,6 +143,7 @@ try {
     $samples.AutoFlush = $true
     $samples.WriteLine('elapsed_ms,private_bytes,working_set_bytes,cpu_seconds,system_commit_bytes,system_commit_limit_bytes,available_physical_bytes')
     $clock = [Diagnostics.Stopwatch]::StartNew()
+    $pressureSince = $null
     while (-not $process.HasExited) {
         try {
             $process.Refresh()
@@ -149,6 +158,22 @@ try {
         $samples.WriteLine([string]::Join(',', @(
             $clock.ElapsedMilliseconds, $privateBytes, $workingBytes, $cpuSeconds,
             $memory.CommitTotalBytes, $memory.CommitLimitBytes, $memory.PhysicalAvailableBytes)))
+        $lowPhysical = $MinimumPhysicalMiB -gt 0 -and $memory.PhysicalAvailableBytes -lt ([long]$MinimumPhysicalMiB * 1MB)
+        $lowCommit = $MinimumCommitMiB -gt 0 -and $memory.CommitAvailableBytes -lt ([long]$MinimumCommitMiB * 1MB)
+        if ($lowPhysical -or $lowCommit) {
+            if ($null -eq $pressureSince) { $pressureSince = $clock.ElapsedMilliseconds }
+            if ($clock.ElapsedMilliseconds - $pressureSince -ge $MemoryPressureSeconds * 1000) {
+                $receipt.EndReason = 'memory pressure'
+                $receipt.MemoryGuard.Trigger = @{
+                    ElapsedMilliseconds=$clock.ElapsedMilliseconds
+                    PhysicalAvailableBytes=$memory.PhysicalAvailableBytes
+                    CommitAvailableBytes=$memory.CommitAvailableBytes
+                    LowPhysical=$lowPhysical; LowCommit=$lowCommit
+                }
+                $process.Kill($true)
+                break
+            }
+        } else { $pressureSince = $null }
         if ($clock.Elapsed.TotalSeconds -ge $DurationSeconds) {
             $receipt.EndReason = 'duration limit'
             $process.Kill($true)
@@ -161,7 +186,7 @@ try {
     [void]$errTask.GetAwaiter().GetResult()
     $receipt.ExitCode = $process.ExitCode
     if (-not $receipt.EndReason) { $receipt.EndReason = 'process exited' }
-    $receipt.Status = if ($receipt.EndReason -eq 'duration limit') { 'timed run completed' } elseif ($process.ExitCode -eq 0) { 'completed' } else { 'failed' }
+    $receipt.Status = if ($receipt.EndReason -eq 'memory pressure') { 'stopped for memory pressure' } elseif ($receipt.EndReason -eq 'duration limit') { 'timed run completed' } elseif ($process.ExitCode -eq 0) { 'completed' } else { 'failed' }
 } catch {
     $receipt.Status = 'failed'
     $receipt.Error = $_.Exception.Message
